@@ -727,7 +727,7 @@ def callback_user_select_category(call):
         # Получаем группы для этой категории
         cursor.execute("""
             SELECT p.id, p.title, p.price_cents, p.duration_days, p.description, 
-                   p.media_file_id, p.media_type, p.media_file_ids, p.group_id, mg.title
+                   p.media_file_id, p.media_type, p.media_file_ids, p.group_id, mg.title as group_title
             FROM plans p
             LEFT JOIN managed_groups mg ON p.group_id = mg.chat_id
             WHERE p.is_active=1 AND p.category_id=?
@@ -750,86 +750,145 @@ def callback_user_select_category(call):
         
         chat_id = call.message.chat.id
         
-        # Отправляем информацию о выбранном предмете
-        bot.answer_callback_query(call.id, f"📚 {category_name}")
-        bot.send_message(chat_id, f"📚 <b>Предмет: {category_name}</b>\n\nДоступные группы обучения:", parse_mode="HTML")
-        
-        # Показываем группы
-        for r in rows:
-            pid, title, price_cents, days, desc, media_file_id, media_type, media_file_ids, group_id, group_title = r
-            txt = f"<b>{title}</b>\n{desc}\n\n💵 Цена в месяц: {price_str_from_cents(price_cents)}"
-            if group_title:
-                txt += f"\n🏠 Группа: {group_title}"
+        # Если групп больше одной - показываем список групп
+        if len(rows) > 1:
+            markup = types.InlineKeyboardMarkup()
+            for r in rows:
+                pid, title, price_cents, days, desc, media_file_id, media_type, media_file_ids, group_id, group_title = r
+                button_text = f"{title}"
+                markup.add(types.InlineKeyboardButton(button_text, callback_data=f"user_select_plan:{pid}"))
             
-            media_ids_list = []
-            if media_file_ids:
-                # Фильтруем только валидные file_id
-                media_ids_list = [m.strip() for m in media_file_ids.split(",") if m.strip() and is_valid_file_id(m.strip())]
-            elif media_file_id and is_valid_file_id(media_file_id.strip()):
-                media_ids_list = [media_file_id.strip()]
+            markup.add(types.InlineKeyboardButton("🔙 Назад к выбору предмета", callback_data="back_to_categories"))
             
-            try:
-                markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton("✅ Выбрать", callback_data=f"select_plan:{pid}"))
-                
-                if len(media_ids_list) > 1:
-                    media_group = []
-                    valid_media_count = 0
-                    
-                    for m in media_ids_list[:10]:  # Ограничиваем 10 медиа
-                        if media_type == "photo":
-                            media_group.append(types.InputMediaPhoto(m))
-                            valid_media_count += 1
-                        elif media_type == "video":
-                            media_group.append(types.InputMediaVideo(m))
-                            valid_media_count += 1
-                    
-                    # Отправляем медиагруппу только если есть валидные медиа
-                    if valid_media_count > 0:
-                        if valid_media_count == 1:
-                            # Если только одно медиа, отправляем как одиночное
-                            if media_type == "photo":
-                                bot.send_photo(chat_id, media_ids_list[0], caption=txt, parse_mode="HTML", reply_markup=markup)
-                            elif media_type == "video":
-                                bot.send_video(chat_id, media_ids_list[0], caption=txt, parse_mode="HTML", reply_markup=markup)
-                        else:
-                            # Если несколько медиа, отправляем группой
-                            bot.send_media_group(chat_id, media_group)
-                            bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
-                    else:
-                        # Если нет валидных медиа, отправляем только текст
-                        bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
-                        
-                elif len(media_ids_list) == 1:
-                    # Одно медиа
-                    m = media_ids_list[0]
-                    if media_type == "photo":
-                        bot.send_photo(chat_id, m, caption=txt, parse_mode="HTML", reply_markup=markup)
-                    elif media_type == "video":
-                        bot.send_video(chat_id, m, caption=txt, parse_mode="HTML", reply_markup=markup)
-                    else:
-                        bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
-                else:
-                    # Нет медиа
-                    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
-                    
-            except Exception as e:
-                logging.exception("Error sending plan media")
-                # При ошибке отправляем хотя бы текст
-                try:
-                    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
-                except:
-                    pass
+            bot.answer_callback_query(call.id, f"📚 {category_name}")
+            bot.send_message(chat_id, 
+                           f"📚 <b>Предмет: {category_name}</b>\n\n"
+                           f"Выберите группу обучения:",
+                           parse_mode="HTML", reply_markup=markup)
+            return
         
-        # Добавляем кнопку возврата к выбору категории
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 Назад к выбору предмета", callback_data="back_to_categories"))
-        bot.send_message(chat_id, "⬆️ Выберите группу обучения или вернитесь к выбору предмета:", reply_markup=markup)
+        # Если группа только одна - сразу показываем её информацию
+        r = rows[0]
+        pid, title, price_cents, days, desc, media_file_id, media_type, media_file_ids, group_id, group_title = r
+        
+        # Отправляем информацию о группе
+        send_plan_info(chat_id, pid, title, price_cents, desc, media_file_id, media_type, media_file_ids, group_title)
         
     except Exception as e:
         logging.exception("Error in callback_user_select_category")
         bot.answer_callback_query(call.id, "❌ Ошибка при выборе предмета")
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("user_select_plan:"))
+def callback_user_select_plan(call):
+    """Обработчик выбора конкретной группы из списка"""
+    try:
+        user = call.from_user
+        plan_id = int(call.data.split(":")[1])
+        
+        # Получаем информацию о группе
+        cursor.execute("""
+            SELECT p.id, p.title, p.price_cents, p.duration_days, p.description, 
+                   p.media_file_id, p.media_type, p.media_file_ids, p.group_id, mg.title as group_title
+            FROM plans p
+            LEFT JOIN managed_groups mg ON p.group_id = mg.chat_id
+            WHERE p.id=?
+        """, (plan_id,))
+        
+        r = cursor.fetchone()
+        if not r:
+            bot.answer_callback_query(call.id, "❌ Группа не найдена.")
+            return
+            
+        pid, title, price_cents, days, desc, media_file_id, media_type, media_file_ids, group_id, group_title = r
+        
+        bot.answer_callback_query(call.id, f"📋 {title}")
+        
+        # Отправляем информацию о группе
+        send_plan_info(call.message.chat.id, pid, title, price_cents, desc, media_file_id, media_type, media_file_ids, group_title)
+        
+    except Exception as e:
+        logging.exception("Error in callback_user_select_plan")
+        bot.answer_callback_query(call.id, "❌ Ошибка при выборе группы")
+
+def send_plan_info(chat_id, plan_id, title, price_cents, description, media_file_id, media_type, media_file_ids, group_title):
+    """Функция для отправки информации о группе с медиа и кнопкой выбора"""
+    txt = f"<b>{title}</b>\n{description}\n\n💵 Цена в месяц: {price_str_from_cents(price_cents)}"
+    if group_title:
+        txt += f"\n🏠 Группа: {group_title}"
     
+    media_ids_list = []
+    if media_file_ids:
+        # Фильтруем только валидные file_id
+        media_ids_list = [m.strip() for m in media_file_ids.split(",") if m.strip() and is_valid_file_id(m.strip())]
+    elif media_file_id and is_valid_file_id(media_file_id.strip()):
+        media_ids_list = [media_file_id.strip()]
+    
+    try:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Выбрать", callback_data=f"select_plan:{plan_id}"))
+        markup.add(types.InlineKeyboardButton("🔙 Назад к списку групп", callback_data="back_to_plans_list"))
+        
+        if len(media_ids_list) > 1:
+            media_group = []
+            valid_media_count = 0
+            
+            for m in media_ids_list[:10]:  # Ограничиваем 10 медиа
+                if media_type == "photo":
+                    media_group.append(types.InputMediaPhoto(m))
+                    valid_media_count += 1
+                elif media_type == "video":
+                    media_group.append(types.InputMediaVideo(m))
+                    valid_media_count += 1
+            
+            # Отправляем медиагруппу только если есть валидные медиа
+            if valid_media_count > 0:
+                if valid_media_count == 1:
+                    # Если только одно медиа, отправляем как одиночное
+                    if media_type == "photo":
+                        bot.send_photo(chat_id, media_ids_list[0], caption=txt, parse_mode="HTML", reply_markup=markup)
+                    elif media_type == "video":
+                        bot.send_video(chat_id, media_ids_list[0], caption=txt, parse_mode="HTML", reply_markup=markup)
+                else:
+                    # Если несколько медиа, отправляем группой
+                    bot.send_media_group(chat_id, media_group)
+                    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+            else:
+                # Если нет валидных медиа, отправляем только текст
+                bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+                
+        elif len(media_ids_list) == 1:
+            # Одно медиа
+            m = media_ids_list[0]
+            if media_type == "photo":
+                bot.send_photo(chat_id, m, caption=txt, parse_mode="HTML", reply_markup=markup)
+            elif media_type == "video":
+                bot.send_video(chat_id, m, caption=txt, parse_mode="HTML", reply_markup=markup)
+            else:
+                bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+        else:
+            # Нет медиа
+            bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+            
+    except Exception as e:
+        logging.exception("Error sending plan media")
+        # При ошибке отправляем хотя бы текст
+        try:
+            bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+        except:
+            pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_plans_list")
+def callback_back_to_plans_list(call):
+    """Возврат к списку групп в выбранном предмете"""
+    try:
+        # Нужно получить category_id из предыдущего сообщения или состояния
+        # Для простоты вернем пользователя к выбору предмета
+        show_plans(call.message)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logging.exception("Error in callback_back_to_plans_list")
+        bot.answer_callback_query(call.id, "❌ Ошибка")
+
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_categories")
 def callback_back_to_categories(call):
     """Возврат к выбору категории"""

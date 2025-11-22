@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+student_bot.db
 # C extensions
 *.so
 
