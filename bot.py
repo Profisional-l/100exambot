@@ -3641,15 +3641,15 @@ def callback_edit_plan(call):
     markup = types.InlineKeyboardMarkup()
     markup.row(types.InlineKeyboardButton("📚 Изменить предмет", callback_data=f"edit_field:category:{plan_id}"))
     markup.row(
-        types.InlineKeyboardButton("📝 Редактировать название", callback_data=f"edit_field:title:{plan_id}"),
-        types.InlineKeyboardButton("💰 Редактировать цену", callback_data=f"edit_field:price:{plan_id}")
+        types.InlineKeyboardButton("📝 Ред. название", callback_data=f"edit_field:title:{plan_id}"),
+        types.InlineKeyboardButton("💰 Ред. цену", callback_data=f"edit_field:price:{plan_id}")
     )
     markup.row(
-        types.InlineKeyboardButton("📋 Редактировать описание", callback_data=f"edit_field:description:{plan_id}"),
+        types.InlineKeyboardButton("📋 Ред. описание", callback_data=f"edit_field:description:{plan_id}"),
         types.InlineKeyboardButton("👥 Изменить группу", callback_data=f"edit_field:group:{plan_id}")
     )
     markup.row(
-        types.InlineKeyboardButton("🖼️ Управление медиа", callback_data=f"edit_field:media:{plan_id}"),
+        types.InlineKeyboardButton("✏️🖼️ медиа", callback_data=f"edit_field:media:{plan_id}"),
         types.InlineKeyboardButton("✅ Завершить редактирование", callback_data=f"edit_finish:{plan_id}")
     )
     
