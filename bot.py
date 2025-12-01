@@ -322,12 +322,18 @@ def get_bot_invite_link():
     return f"https://t.me/{username}?startgroup=true"
 
 def is_bot_admin_in_chat(chat_id):
+    """Проверяет, является ли бот администратором в чате"""
     try:
+        chat = bot.get_chat(chat_id)
+        if chat.type in ['private', 'channel']:
+            return True  # Для каналов и приватных чатов считаем, что бот имеет доступ
+        
         member = bot.get_chat_member(chat_id, BOT_ID)
         return member.status in ['administrator', 'creator']
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Can't check bot admin status in chat {chat_id}: {e}")
         return False
-
+    
 def add_group_to_db(chat_id, title, chat_type='group'):
     try:
         cursor.execute("INSERT OR REPLACE INTO managed_groups (chat_id, title, type, added_date) VALUES (?, ?, ?, ?)",
@@ -395,8 +401,8 @@ def can_user_pay_partial(user_id, plan_id):
     """, (user_id, plan_id, month, year))
     return cursor.fetchone() is not None
 
-def activate_subscription(user_id, plan_id, payment_type='full', group_id=None):
-    """Активирует подписку для пользователя - только полная оплата"""
+def activate_subscription(user_id, plan_id, payment_type='full', group_id=None, is_renewal=False):
+    """Активирует или продлевает подписку для пользователя"""
     cursor.execute("SELECT price_cents, title, group_id FROM plans WHERE id=?", (plan_id,))
     plan = cursor.fetchone()
     if not plan:
@@ -404,55 +410,77 @@ def activate_subscription(user_id, plan_id, payment_type='full', group_id=None):
     
     price_cents, plan_title, plan_group_id = plan
     current_month, current_year = get_current_period()
+    now_ts = int(time.time())
+    now = now_local()
     
     target_group_id = plan_group_id if plan_group_id else group_id
     if not target_group_id:
         return False, "Не указана группа для подписки"
     
-    start_ts = int(time.time())
-    now = now_local()
+    # Проверяем существующую активную подписку
+    cursor.execute("""
+        SELECT id, active, current_period_month, current_period_year, end_ts, part_paid
+        FROM subscriptions 
+        WHERE user_id=? AND plan_id=? AND active=1
+        ORDER BY id DESC LIMIT 1
+    """, (user_id, plan_id))
     
-    # Всегда полная оплата - доступ до 5 числа следующего месяца
+    existing_sub = cursor.fetchone()
+    
+    # Расчет даты окончания - всегда до 5 числа следующего месяца
+    # Определяем следующий месяц
     if now.month == 12:
         next_month = 1
         next_year = now.year + 1
     else:
         next_month = now.month + 1
         next_year = now.year
+    
     end_dt = LOCAL_TZ.localize(datetime(next_year, next_month, 5, 23, 59, 59))
     end_ts = int(end_dt.timestamp())
     part_paid = 'full'
     
     invite_link = create_chat_invite_link_one_time(BOT_TOKEN, target_group_id, expire_seconds=7*24*3600, member_limit=1)
     
-    # Проверяем существующую подписку
-    cursor.execute("""
-        SELECT id FROM subscriptions 
-        WHERE user_id=? AND plan_id=? AND current_period_month=? AND current_period_year=?
-    """, (user_id, plan_id, current_month, current_year))
-    
-    existing_sub = cursor.fetchone()
-    
     if existing_sub:
-        # Обновляем существующую подписку
-        sub_id = existing_sub[0]
-        cursor.execute("""
-            UPDATE subscriptions 
-            SET payment_type=?, part_paid=?, end_ts=?, invite_link=?, active=1, removed=0
-            WHERE id=?
-        """, (payment_type, part_paid, end_ts, invite_link, sub_id))
+        sub_id, active, existing_month, existing_year, existing_end_ts, existing_part_paid = existing_sub
+        
+        # Если подписка уже оплачена на текущий месяц и не истекла
+        if existing_month == current_month and existing_year == current_year and existing_part_paid == 'full' and existing_end_ts > now_ts:
+            # Просто обновляем ссылку
+            cursor.execute("""
+                UPDATE subscriptions 
+                SET invite_link=?, last_notification_ts=NULL
+                WHERE id=?
+            """, (invite_link, sub_id))
+            conn.commit()
+            return True, invite_link
+        else:
+            # Обновляем существующую подписку на новый месяц
+            cursor.execute("""
+                UPDATE subscriptions 
+                SET current_period_month=?, current_period_year=?, part_paid=?, 
+                    start_ts=?, end_ts=?, invite_link=?, last_notification_ts=NULL,
+                    active=1, removed=0, payment_type=?
+                WHERE id=?
+            """, (current_month, current_year, part_paid, now_ts, end_ts, invite_link, payment_type, sub_id))
     else:
         # Создаем новую подписку
         cursor.execute("""
             INSERT INTO subscriptions (user_id, plan_id, start_ts, end_ts, invite_link, active, removed, group_id, 
-                                     payment_type, current_period_month, current_period_year, part_paid, next_payment_date) 
-            VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?)
-        """, (user_id, plan_id, start_ts, end_ts, invite_link, target_group_id, payment_type, 
+                                     payment_type, current_period_month, current_period_year, part_paid, next_payment_date, last_notification_ts) 
+            VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, NULL)
+        """, (user_id, plan_id, now_ts, end_ts, invite_link, target_group_id, payment_type, 
               current_month, current_year, part_paid, end_ts))
     
     conn.commit()
-    
     return True, invite_link
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_my_subscription")
+def callback_check_my_subscription(call):
+    """Показывает подписки пользователя"""
+    show_my_subscription(call.message)
+    bot.answer_callback_query(call.id)
 
 def generate_promo_code(length=8):
     """Генерирует уникальный промокод"""
@@ -858,19 +886,87 @@ def callback_user_select_category(call):
         logging.exception("Error in callback_user_select_category")
         bot.answer_callback_query(call.id, "❌ Ошибка при выборе предмета")
 
-@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("user_select_plan:"))
-def callback_user_select_plan(call):
-    """Обработчик выбора конкретной группы из списка - сразу показывает оплату"""
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("buy_for_existing:"))
+def callback_buy_for_existing(call):
+    """Оплата для существующей подписки"""
     try:
         user = call.from_user
         plan_id = int(call.data.split(":")[1])
         
+        # Проверяем существующую подписку
+        existing_sub = check_existing_subscription(user.id, plan_id)
+        if not existing_sub:
+            bot.answer_callback_query(call.id, "❌ Подписка не найдена")
+            return
+            
+        # ИСПРАВЛЕННАЯ ПРОВЕРКА: проверяем 'paid' вместо всего объекта
+        if existing_sub['paid']:  
+            bot.answer_callback_query(call.id, "✅ Подписка уже оплачена")
+            return
+        
+        # Получаем информацию о тарифе
+        cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (plan_id,))
+        plan = cursor.fetchone()
+        if not plan:
+            bot.answer_callback_query(call.id, "❌ Тариф не найден.")
+            return
+            
+        title, price_cents, description, group_id = plan
+        
+        # Показываем выбор способа оплаты
+        user_states[user.id] = {
+            'plan_id': plan_id,
+            'original_price': price_cents,
+            'title': title,
+            'description': description,
+            'group_id': group_id,
+            'payment_type': 'full',
+            'mode': 'renewal'  # Режим продления
+        }
+        
+        payment_methods = get_active_payment_methods()
+        if not payment_methods:
+            bot.answer_callback_query(call.id, "❌ Нет доступных способов оплаты")
+            return
+            
+        if len(payment_methods) == 1:
+            method_id, name, mtype, method_desc, details = payment_methods[0]
+            if mtype == "card":
+                process_card_payment(call, plan_id, user, title, price_cents, description, group_id, 'full')
+            else:
+                process_manual_payment_start(call, plan_id, user, title, price_cents, description, details, 'full')
+        else:
+            markup = types.InlineKeyboardMarkup()
+            for method_id, name, mtype, method_desc, details in payment_methods:
+                markup.add(types.InlineKeyboardButton(name, callback_data=f"paymethod:{plan_id}:{method_id}:full"))
+            
+            markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_payment"))
+            
+            bot.answer_callback_query(call.id, "💳 Выберите способ оплаты")
+            bot.send_message(call.message.chat.id, f"💳 <b>Продление подписки на '{title}'</b>", parse_mode="HTML", reply_markup=markup)
+        
+    except Exception as e:
+        logging.exception("Error in callback_buy_for_existing")
+        bot.answer_callback_query(call.id, "❌ Ошибка при оформлении заказа")
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("user_select_plan:"))
+def callback_user_select_plan(call):
+    """Обработчик выбора конкретной группы из списка"""
+    try:
+        user = call.from_user
+        plan_id = int(call.data.split(":")[1])
+        
+        # Проверяем существующую подписку
+        existing_sub = check_existing_subscription(user.id, plan_id)
+        
         # Получаем информацию о группе
         cursor.execute("""
             SELECT p.id, p.title, p.price_cents, p.duration_days, p.description, 
-                   p.media_file_id, p.media_type, p.media_file_ids, p.group_id, mg.title as group_title
+                   p.media_file_id, p.media_type, p.media_file_ids, p.group_id, mg.title as group_title,
+                   c.name as category_name
             FROM plans p
             LEFT JOIN managed_groups mg ON p.group_id = mg.chat_id
+            LEFT JOIN categories c ON p.category_id = c.id
             WHERE p.id=?
         """, (plan_id,))
         
@@ -879,43 +975,61 @@ def callback_user_select_plan(call):
             bot.answer_callback_query(call.id, "❌ Группа не найдена.")
             return
             
-        pid, title, price_cents, days, desc, media_file_id, media_type, media_file_ids, group_id, group_title = r
+        (pid, title, price_cents, days, desc, media_file_id, media_type, 
+         media_file_ids, group_id, group_title, category_name) = r
         
-        # Получаем доступные варианты оплаты
-        payment_options = get_payment_options(user.id, pid)
-        
-        text = (f"💳 <b>Оформление подписки на группу '{title}'</b>\n\n"
-                f"💰 Цена в месяц: {price_str_from_cents(price_cents)}\n"
-                f"📋 Описание: {desc}\n\n")
-        
-        markup = types.InlineKeyboardMarkup()
-
-        if payment_options:
-            text += "<b>Детали</b>\n"
-            for option in payment_options:
-                text += f"• {option['text']}\n  {option['description']}\n\n"
-
-            for option in payment_options:
-                markup.add(types.InlineKeyboardButton(f"💸 Оплатить {price_str_from_cents(option['price'])}", callback_data=f"buy_{option['type']}:{pid}"))
-
-            # Добавляем кнопку оплаты с промокодом
-            markup.add(types.InlineKeyboardButton("🎫 Оплатить с промокодом", callback_data=f"buy_with_promo:{pid}"))
+        # Формируем текст в зависимости от состояния
+        if existing_sub and existing_sub['paid']:
+            # Если подписка уже оплачена на текущий месяц
+            end_date = datetime.fromtimestamp(existing_sub['end_ts'], LOCAL_TZ).strftime('%d.%m.%Y %H:%M')
+            text = (f"✅ <b>У вас уже есть активная подписка на эту группу!</b>\n\n"
+                   f"🏷️ Группа: {title}\n"
+                   f"📚 Предмет: {category_name}\n"
+                   f"📅 Оплачено до: {end_date}\n\n"
+                   f"Следующая оплата потребуется <b>{datetime.fromtimestamp(existing_sub['end_ts'], LOCAL_TZ).strftime('%d.%m.%Y')}</b>.")
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Назад к списку групп", callback_data="back_to_plans_list"))
+            
+            bot.answer_callback_query(call.id, "✅ Подписка активна")
+            
+        elif existing_sub and existing_sub['needs_renewal']:
+            # Есть подписка, но нужно продление
+            old_end_date = datetime.fromtimestamp(existing_sub['end_ts'], LOCAL_TZ).strftime('%d.%m.%Y %H:%M')
+            
+            text = (f"🔄 <b>Продление подписки на группу '{title}'</b>\n\n"
+                   f"📚 Предмет: {category_name}\n"
+                   f"📅 Текущая подписка действительна до: {old_end_date}\n"
+                   f"💰 Цена продления: {price_str_from_cents(price_cents)}\n"
+                   f"📋 Описание: {desc or 'Описание отсутствует'}\n\n"
+                   f"<i>После оплаты срок действия будет продлен на месяц.</i>")
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(f"🔄 Продлить подписку", callback_data=f"renew_plan:{plan_id}"))
+            markup.add(types.InlineKeyboardButton("🎫 Оплатить с промокодом", callback_data=f"buy_with_promo:{plan_id}"))
+            markup.add(types.InlineKeyboardButton("🔙 Назад к списку групп", callback_data="back_to_plans_list"))
+            
+            bot.answer_callback_query(call.id, f"📋 {title}")
+            
         else:
-            active_type = get_active_payment_type()
-            if active_type == 'second':
-                text += "❌ <b>У вас нет активной первой части оплаты для этой группы.</b>\n\n"
-            else:
-                text += "❌ <b>Сейчас не период оплаты.</b>\n\n"
-
-            text += ("💳 <b>Периоды оплаты:</b>\n"
-                    "• 1-5 числа: полная оплата или первая часть\n"
-                    "• 15-20 числа: вторая часть (только при оплаченной первой)\n"
-                    "• В другое время: полная оплата\n\n"
-                    "Возвращайтесь в указанные даты!")
-
-        markup.add(types.InlineKeyboardButton("🔙 Назад к списку групп", callback_data="back_to_plans_list"))
-
-        bot.answer_callback_query(call.id, f"📋 {title}")
+            # Новой подписки нет или она полностью истекла
+            text = (f"💳 <b>Оформление подписки на группу '{title}'</b>\n\n"
+                   f"📚 Предмет: {category_name}\n"
+                   f"💰 Цена в месяц: {price_str_from_cents(price_cents)}\n"
+                   f"📋 Описание: {desc or 'Описание отсутствует'}\n\n"
+                   f"<b>Детали оплаты:</b>\n"
+                   f"• Полная оплата - доступ до 5 числа следующего месяца\n"
+                   f"• Оплата принимается с 1 по 5 число каждого месяца")
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(f"💸 Оплатить {price_str_from_cents(price_cents)}", 
+                                                 callback_data=f"buy_full:{plan_id}"))
+            markup.add(types.InlineKeyboardButton("🎫 Оплатить с промокодом", 
+                                                 callback_data=f"buy_with_promo:{plan_id}"))
+            markup.add(types.InlineKeyboardButton("🔙 Назад к списку групп", 
+                                                 callback_data="back_to_plans_list"))
+            
+            bot.answer_callback_query(call.id, f"📋 {title}")
         
         # Отправляем медиа если есть
         media_ids_list = []
@@ -940,9 +1054,11 @@ def callback_user_select_plan(call):
                 if valid_media_count > 0:
                     if valid_media_count == 1:
                         if media_type == "photo":
-                            bot.send_photo(call.message.chat.id, media_ids_list[0], caption=text, parse_mode="HTML", reply_markup=markup)
+                            bot.send_photo(call.message.chat.id, media_ids_list[0], caption=text, 
+                                         parse_mode="HTML", reply_markup=markup)
                         elif media_type == "video":
-                            bot.send_video(call.message.chat.id, media_ids_list[0], caption=text, parse_mode="HTML", reply_markup=markup)
+                            bot.send_video(call.message.chat.id, media_ids_list[0], caption=text, 
+                                         parse_mode="HTML", reply_markup=markup)
                     else:
                         bot.send_media_group(call.message.chat.id, media_group)
                         bot.send_message(call.message.chat.id, text, parse_mode="HTML", reply_markup=markup)
@@ -952,9 +1068,11 @@ def callback_user_select_plan(call):
             elif len(media_ids_list) == 1:
                 m = media_ids_list[0]
                 if media_type == "photo":
-                    bot.send_photo(call.message.chat.id, m, caption=text, parse_mode="HTML", reply_markup=markup)
+                    bot.send_photo(call.message.chat.id, m, caption=text, 
+                                 parse_mode="HTML", reply_markup=markup)
                 elif media_type == "video":
-                    bot.send_video(call.message.chat.id, m, caption=text, parse_mode="HTML", reply_markup=markup)
+                    bot.send_video(call.message.chat.id, m, caption=text, 
+                                 parse_mode="HTML", reply_markup=markup)
                 else:
                     bot.send_message(call.message.chat.id, text, parse_mode="HTML", reply_markup=markup)
             else:
@@ -967,7 +1085,273 @@ def callback_user_select_plan(call):
     except Exception as e:
         logging.exception("Error in callback_user_select_plan")
         bot.answer_callback_query(call.id, "❌ Ошибка при выборе группы")
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("new_link:"))
+def callback_new_link(call):
+    """
+    Генерирует новую одноразовую пригласительную ссылку для подписки.
+    Callback data: new_link:{subscription_id}
+    """
+    try:
+        uid = call.from_user.id
+        parts = call.data.split(":")
+        if len(parts) < 2:
+            bot.answer_callback_query(call.id, "❌ Неверные данные.")
+            return
+
+        sub_id = int(parts[1])
+
+        # Получаем подписку
+        cursor.execute("SELECT user_id, plan_id, group_id, invite_link FROM subscriptions WHERE id=?", (sub_id,))
+        row = cursor.fetchone()
+        if not row:
+            bot.answer_callback_query(call.id, "❌ Подписка не найдена.")
+            return
+
+        sub_user_id, plan_id, group_id, old_invite = row
+
+        # Разрешаем только владельцу подписки или админам получать новую ссылку
+        if uid != sub_user_id and call.from_user.id not in ADMIN_IDS:
+            bot.answer_callback_query(call.id, "🚫 Только владелец подписки или администратор может запросить новую ссылку.")
+            return
+
+        if not group_id:
+            bot.answer_callback_query(call.id, "❌ Для этой подписки не указана группа (group_id). Свяжитесь с администрацией.")
+            return
+
+        # Проверяем, что бот администратор в группе (рекомендуется)
+        try:
+            if not is_bot_admin_in_chat(group_id):
+                # Попробуем предупредить больше информативно
+                bot.answer_callback_query(call.id, "❌ Я не администратор в целевой группе — не могу создать ссылку. Назначьте боту права администратора.")
+                return
+        except Exception:
+            # не критично — попробуем создать ссылку через API, но предупредим
+            logging.warning("Не удалось проверить статус бота в группе, пробуем создать ссылку напрямую.")
+
+        # Создаем новую одноразовую ссылку (expire_seconds можно менять)
+        invite = create_chat_invite_link_one_time(BOT_TOKEN, group_id, expire_seconds=7*24*3600, member_limit=1)
+        if not invite:
+            bot.answer_callback_query(call.id, "❌ Не удалось создать пригласительную ссылку. Попробуйте позже.")
+            logging.warning(f"createChatInviteLink вернул None для group_id={group_id}, sub_id={sub_id}")
+            return
+
+        # Сохраняем новую ссылку в БД
+        try:
+            cursor.execute("UPDATE subscriptions SET invite_link=?, last_notification_ts=? WHERE id=?", (invite, int(time.time()), sub_id))
+            conn.commit()
+        except Exception as e:
+            logging.exception("Ошибка записи новой ссылки в БД")
+            bot.answer_callback_query(call.id, "❌ Не удалось сохранить ссылку в базе данных (админ уведомлён).")
+            return
+
+        # Отправляем ссылку пользователю (и отвечаем на callback)
+        try:
+            bot.answer_callback_query(call.id, "🔗 Сгенерирована новая ссылка!")
+            bot.send_message(sub_user_id, f"🔗 Ваша новая одноразовая пригласительная ссылка:\n\n{invite}\n\nСсылка одноразовая и действительна короткое время.")
+        except Exception as e:
+            logging.exception("Ошибка отправки новой ссылки пользователю")
+            # если не удалось отправить пользователю (например, мы в колбэке от админа),
+            # отправим в чат где нажали кнопку
+            try:
+                bot.send_message(call.message.chat.id, f"🔗 Ссылка:\n\n{invite}")
+            except:
+                pass
+
+    except Exception as e:
+        logging.exception("Ошибка в callback_new_link")
+        try:
+            bot.answer_callback_query(call.id, "❌ Внутренняя ошибка при создании ссылки.")
+        except:
+            pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("buy_full:"))
+def callback_buy_full(call):
+    """Обработчик покупки новой подписки"""
+    try:
+        user = call.from_user
+        plan_id = int(call.data.split(":")[1])
         
+        cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (plan_id,))
+        plan = cursor.fetchone()
+        if not plan:
+            bot.answer_callback_query(call.id, "❌ Группа не найдена.")
+            return
+        title, price_cents, description, group_id = plan
+        
+        # Сохраняем информацию о выбранном тарифе
+        user_states[user.id] = {
+            'plan_id': plan_id,
+            'original_price': price_cents,
+            'title': title,
+            'description': description,
+            'group_id': group_id,
+            'payment_type': 'full',
+            'mode': 'new_subscription'  # Новая подписка
+        }
+        
+        # Показываем выбор способа оплаты
+        payment_methods = get_active_payment_methods()
+        if not payment_methods:
+            bot.answer_callback_query(call.id, "❌ Нет доступных способов оплаты")
+            return
+            
+        if len(payment_methods) == 1:
+            method_id, name, mtype, method_desc, details = payment_methods[0]
+            if mtype == "card":
+                process_card_payment(call, plan_id, user, title, price_cents, description, group_id, 'full')
+            else:
+                process_manual_payment_start(call, plan_id, user, title, price_cents, description, details, 'full')
+        else:
+            markup = types.InlineKeyboardMarkup()
+            for method_id, name, mtype, method_desc, details in payment_methods:
+                markup.add(types.InlineKeyboardButton(name, callback_data=f"paymethod_new:{plan_id}:{method_id}:full"))
+            
+            markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_payment"))
+            
+            bot.answer_callback_query(call.id, "💳 Выберите способ оплаты")
+            bot.send_message(call.message.chat.id, f"💳 <b>Оплата новой подписки на '{title}'</b>", 
+                           parse_mode="HTML", reply_markup=markup)
+        
+    except Exception as e:
+        logging.exception("Error in callback_buy_full")
+        bot.answer_callback_query(call.id, "❌ Ошибка при оформлении заказа")
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("paymethod_new:"))
+def callback_paymethod_new(call):
+    """Обработка выбора способа оплаты для новой подписки"""
+    try:
+        parts = call.data.split(":")
+        pid = int(parts[1])
+        method_id = int(parts[2])
+        payment_type = parts[3]
+        
+        user = call.from_user
+        
+        if user.id not in user_states or user_states[user.id].get('mode') != 'new_subscription':
+            bot.answer_callback_query(call.id, "❌ Сессия устарела")
+            return
+            
+        state = user_states[user.id]
+        
+        method = get_payment_method_by_id(method_id)
+        if not method:
+            bot.answer_callback_query(call.id, "❌ Способ оплаты не найден.")
+            return
+            
+        method_id, name, mtype, method_desc, details = method
+        
+        if mtype == "card":
+            process_card_payment(call, pid, user, state['title'], state['original_price'], 
+                               state['description'], state['group_id'], payment_type)
+        else:  # manual
+            process_manual_payment_start(call, pid, user, state['title'], state['original_price'], 
+                                        state['description'], details, payment_type)
+            
+    except Exception as e:
+        logging.exception("Error in callback_paymethod_new")
+        bot.answer_callback_query(call.id, "❌ Ошибка при выборе способа оплаты")
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("renew_plan:"))
+def callback_renew_plan(call):
+    """Обработчик продления существующей подписки"""
+    try:
+        user = call.from_user
+        plan_id = int(call.data.split(":")[1])
+        
+        # Проверяем существующую подписку
+        existing_sub = check_existing_subscription(user.id, plan_id)
+        
+        if not existing_sub:
+            bot.answer_callback_query(call.id, "❌ Подписка не найдена.")
+            return
+            
+        if existing_sub['paid']:
+            bot.answer_callback_query(call.id, "✅ Подписка уже оплачена на текущий месяц.")
+            return
+        
+        # Получаем информацию о тарифе
+        cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (plan_id,))
+        plan = cursor.fetchone()
+        if not plan:
+            bot.answer_callback_query(call.id, "❌ Тариф не найден.")
+            return
+            
+        title, price_cents, description, group_id = plan
+        
+        # Показываем выбор способа оплаты для продления
+        user_states[user.id] = {
+            'plan_id': plan_id,
+            'original_price': price_cents,
+            'title': title,
+            'description': description,
+            'group_id': group_id,
+            'payment_type': 'full',
+            'mode': 'renewal',
+            'existing_sub_id': existing_sub['id']  # Сохраняем ID существующей подписки
+        }
+        
+        payment_methods = get_active_payment_methods()
+        if not payment_methods:
+            bot.answer_callback_query(call.id, "❌ Нет доступных способов оплаты")
+            return
+            
+        if len(payment_methods) == 1:
+            method_id, name, mtype, method_desc, details = payment_methods[0]
+            if mtype == "card":
+                process_card_payment(call, plan_id, user, title, price_cents, description, group_id, 'full')
+            else:
+                process_manual_payment_start(call, plan_id, user, title, price_cents, description, details, 'full')
+        else:
+            markup = types.InlineKeyboardMarkup()
+            for method_id, name, mtype, method_desc, details in payment_methods:
+                markup.add(types.InlineKeyboardButton(name, callback_data=f"paymethod_renew:{plan_id}:{method_id}:full"))
+            
+            markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_payment"))
+            
+            bot.answer_callback_query(call.id, "💳 Выберите способ оплаты")
+            bot.send_message(call.message.chat.id, f"💳 <b>Продление подписки на '{title}'</b>", parse_mode="HTML", reply_markup=markup)
+        
+    except Exception as e:
+        logging.exception("Error in callback_renew_plan")
+        bot.answer_callback_query(call.id, "❌ Ошибка при оформлении продления")
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("paymethod_renew:"))
+def callback_paymethod_renew(call):
+    """Обработка выбора способа оплаты для продления"""
+    try:
+        parts = call.data.split(":")
+        pid = int(parts[1])
+        method_id = int(parts[2])
+        payment_type = parts[3]
+        
+        user = call.from_user
+        
+        if user.id not in user_states or user_states[user.id].get('mode') != 'renewal':
+            bot.answer_callback_query(call.id, "❌ Сессия устарела")
+            return
+            
+        state = user_states[user.id]
+        
+        method = get_payment_method_by_id(method_id)
+        if not method:
+            bot.answer_callback_query(call.id, "❌ Способ оплаты не найден.")
+            return
+            
+        method_id, name, mtype, method_desc, details = method
+        
+        if mtype == "card":
+            process_card_payment(call, pid, user, state['title'], state['original_price'], 
+                               state['description'], state['group_id'], payment_type)
+        else:  # manual
+            process_manual_payment_start(call, pid, user, state['title'], state['original_price'], 
+                                        state['description'], details, payment_type)
+            
+    except Exception as e:
+        logging.exception("Error in callback_paymethod_renew")
+        bot.answer_callback_query(call.id, "❌ Ошибка при выборе способа оплаты")
+
 def send_plan_info(chat_id, plan_id, title, price_cents, description, media_file_id, media_type, media_file_ids, group_title):
     """Функция для отправки информации о группе с медиа и кнопкой выбора"""
     txt = f"<b>{title}</b>\n{description}\n\n💵 Цена в месяц: {price_str_from_cents(price_cents)}"
@@ -1238,34 +1622,43 @@ def show_ref(message):
 @bot.message_handler(func=lambda message: message.text == "🎫 Мои подписки")
 @only_private
 def show_my_subscription(message):
+    """Показывает подписки пользователя с кнопкой продления"""
     uid = message.from_user.id
     cursor.execute("""
-        SELECT s.id, s.plan_id, s.start_ts, s.end_ts, s.active, s.invite_link, p.title, s.payment_type, s.part_paid, s.current_period_month, s.current_period_year
+        SELECT s.id, s.plan_id, s.start_ts, s.end_ts, s.active, s.invite_link, 
+               p.title, s.payment_type, s.part_paid, s.current_period_month, 
+               s.current_period_year, p.price_cents
         FROM subscriptions s
         LEFT JOIN plans p ON s.plan_id = p.id
         WHERE s.user_id=? AND s.active=1
         ORDER BY s.end_ts DESC
     """, (uid,))
     rows = cursor.fetchall()
+    
     if not rows:
         bot.send_message(uid, "📭 У вас нет активных подписок.")
         return
     
     current_month, current_year = get_current_period()
+    now_ts = int(time.time())
     
     for row in rows:
-        sid, pid, start_ts, end_ts, active, invite_link, title, payment_type, part_paid, period_month, period_year = row
+        (sid, pid, start_ts, end_ts, active, invite_link, title, 
+         payment_type, part_paid, period_month, period_year, price_cents) = row
         
-        status_text = ""
-        if period_month == current_month and period_year == current_year:
-            if part_paid == 'full':
-                status_text = "✅ Оплачено полностью"
+        # Правильная проверка статуса
+        if period_month == current_month and period_year == current_year and part_paid == 'full':
+            if end_ts > now_ts:
+                status_text = "✅ Активна"
+                needs_renewal = False
             else:
-                status_text = "❌ Не оплачено"
+                status_text = "❌ Истекла"
+                needs_renewal = True
         else:
-            status_text = "📅 Требуется оплата за новый месяц"
+            status_text = "🔄 Требуется продление"
+            needs_renewal = True
         
-        txt = (f"🎫 Группа: {title or pid}\n"
+        txt = (f"🎫 <b>Группа: {title or pid}</b>\n"
                f"💳 Тип оплаты: Полная оплата\n"
                f"📊 Статус: {status_text}\n"
                f"⏰ Действует до: {datetime.fromtimestamp(end_ts, LOCAL_TZ).strftime('%d.%m.%Y %H:%M')}")
@@ -1273,7 +1666,16 @@ def show_my_subscription(message):
         if invite_link:
             txt += f"\n🔗 Ваша пригласительная ссылка:\n{invite_link}"
         
-        bot.send_message(uid, txt)
+        markup = types.InlineKeyboardMarkup()
+        
+        if needs_renewal:
+            markup.add(types.InlineKeyboardButton(f"🔄 Продлить за {price_str_from_cents(price_cents)}", 
+                                                 callback_data=f"renew_plan:{pid}"))
+        
+        markup.add(types.InlineKeyboardButton("🔗 Получить новую ссылку", 
+                                             callback_data=f"new_link:{sid}"))
+        
+        bot.send_message(uid, txt, parse_mode="HTML", reply_markup=markup)
 
 # ----------------- Payment callbacks ----------------
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("select_plan:"))
@@ -1511,9 +1913,14 @@ def process_card_payment(call, pid, user, title, price_cents, description, group
     
     prices = [types.LabeledPrice(label=title, amount=price_cents)]
     
-    # Создаем payload с информацией о типе оплаты
+    # Определяем режим оплаты
+    state = user_states.get(user.id, {})
+    mode = state.get('mode', 'new_subscription')
+    
     current_month, current_year = get_current_period()
-    payload = f"plan:{pid}:user:{user.id}:type:{payment_type}:month:{current_month}:year:{current_year}:promo:{promo_id or 0}:{int(time.time())}"
+    
+    # Создаем payload с информацией о режиме
+    payload = f"plan:{pid}:user:{user.id}:type:{payment_type}:month:{current_month}:year:{current_year}:promo:{promo_id or 0}:mode:{mode}:{int(time.time())}"
     
     cursor.execute("INSERT OR REPLACE INTO invoices (payload, user_id, plan_id, amount_cents, created_ts, payment_type, period_month, period_year, promo_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (payload, user.id, pid, price_cents, int(time.time()), payment_type, current_month, current_year, promo_id))
@@ -1521,6 +1928,11 @@ def process_card_payment(call, pid, user, title, price_cents, description, group
     
     try:
         description_text = f"{description}\nТип оплаты: {get_payment_type_text(payment_type)}"
+        if mode == 'renewal':
+            description_text += "\nПродление подписки"
+        elif mode == 'new_subscription':
+            description_text += "\nНовая подписка"
+        
         if promo_id:
             description_text += f"\nПрименен промокод"
             
@@ -1535,7 +1947,7 @@ def process_card_payment(call, pid, user, title, price_cents, description, group
     except Exception:
         logging.exception("send_invoice failed")
         bot.answer_callback_query(call.id, "❌ Ошибка создания счёта.")
-
+        
 def process_manual_payment_start(call, pid, user, title, price_cents, description, details, payment_type, promo_id=None):
     """Начало процесса ручной оплаты"""
     user_id = user.id
@@ -1846,60 +2258,61 @@ def got_payment(message):
     payload = sp.invoice_payload
     user_id = message.from_user.id
     
-    # Парсим payload для получения информации
+    # Парсим payload
     parts = payload.split(":")
     plan_id = int(parts[1])
     payment_type = parts[5]
-    period_month = int(parts[7])
-    period_year = int(parts[9])
     promo_id = int(parts[11]) if len(parts) > 11 and parts[11] != '0' else None
-
-    # Получаем информацию о платеже из базы
-    cursor.execute("SELECT user_id, plan_id, amount_cents FROM invoices WHERE payload=?", (payload,))
-    row = cursor.fetchone()
-    if not row:
-        bot.send_message(message.chat.id, "❌ Платёж зарегистрирован, но запись счета не найдена. Обратитесь к админу.")
+    mode = parts[13] if len(parts) > 13 else 'new_subscription'  # Получаем режим
+    
+    # Проверяем состояние пользователя
+    state = user_states.get(user_id, {})
+    
+    # Всегда используем activate_subscription с правильными параметрами
+    success, result = activate_subscription(user_id, plan_id, payment_type, state.get('group_id'))
+    if not success:
+        bot.send_message(user_id, f"❌ Ошибка активации подписки: {result}")
         return
-        
-    user_id_db, plan_id, amount_cents = row
-    payer_id = message.from_user.id
+    
+    cursor.execute("SELECT title FROM plans WHERE id=?", (plan_id,))
+    plan_title = cursor.fetchone()[0]
+    
+    # Определяем текст сообщения в зависимости от режима
+    if mode == 'renewal':
+        txt = (f"✅ <b>Подписка успешно продлена!</b>\n\n"
+               f"🏷️ Группа: {plan_title}\n"
+               f"🔗 Ваша новая пригласительная ссылка (одноразовая):\n{result}\n\n"
+               f"Спасибо, что остаетесь с нами!")
+    else:
+        txt = (f"✅ <b>Подписка успешно оформлена!</b>\n\n"
+               f"🏷️ Группа: {plan_title}\n"
+               f"🔗 Ваша пригласительная ссылка для входа в чат (одноразовая):\n{result}\n\n"
+               f"Добро пожаловать в наше сообщество!")
+    
+    bot.send_message(user_id, txt, parse_mode="HTML")
     
     # Если был применен промокод, отмечаем его использование
     if promo_id and promo_id > 0:
         cursor.execute("INSERT INTO promo_usage (promo_id, user_id, used_ts) VALUES (?, ?, ?)",
-                      (promo_id, payer_id, int(time.time())))
+                      (promo_id, user_id, int(time.time())))
         cursor.execute("UPDATE promo_codes SET used_count = used_count + 1 WHERE id=?", (promo_id,))
         conn.commit()
     
-    cursor.execute("SELECT referred_by FROM users WHERE user_id=?", (payer_id,))
+    # cashback для реферера
+    cursor.execute("SELECT referred_by FROM users WHERE user_id=?", (user_id,))
     urow = cursor.fetchone()
     referred_by = urow[0] if urow else None
     
-    success, result = activate_subscription(payer_id, plan_id, payment_type)
-    if not success:
-        bot.send_message(payer_id, f"❌ Ошибка активации подписки: {result}")
-        return
-    
-    # Отправляем приглашение пользователю
-    cursor.execute("SELECT title FROM plans WHERE id=?", (plan_id,))
-    found = cursor.fetchone()
-    if found:
-        plan_title = found[0]
-        txt = (f"✅ Спасибо за оплату группы '{plan_title}'!\n\n"
-               f"🔗 Ваша приватная ссылка для входа в чат (одноразовая):\n{result}\n\n"
-               f"⏰ Подписка активна до: {datetime.fromtimestamp(int(time.time()) + 30 * 24 * 3600, LOCAL_TZ).strftime('%d.%m.%Y %H:%M')}")
-        
-        bot.send_message(payer_id, txt)
-    else:
-        bot.send_message(payer_id, f"✅ Платёж принят! 🔗 Ваша ссылка: {result}")
-
-    # cashback
     if referred_by:
+        amount_cents = sp.total_amount
         cashback = int(math.floor(amount_cents * REFERRAL_PERCENT / 100.0))
-        cursor.execute("UPDATE users SET cashback_cents = cashback_cents + ? WHERE user_id=?", (cashback, referred_by))
+        cursor.execute("UPDATE users SET cashback_cents = cashback_cents + ? WHERE user_id=?", 
+                      (cashback, referred_by))
         conn.commit()
         try:
-            bot.send_message(referred_by, f"💰 Реферальный кэшбэк! Пользователь @{message.from_user.username or message.from_user.id} оплатил подписку. Вам начислен кэшбэк: {price_str_from_cents(cashback)}")
+            bot.send_message(referred_by, 
+                           f"💰 Реферальный кэшбэк! Пользователь @{message.from_user.username or message.from_user.id} оплатил подписку. "
+                           f"Вам начислен кэшбэк: {price_str_from_cents(cashback)}")
         except:
             pass
     
@@ -3342,86 +3755,6 @@ def callback_cancel(call):
     bot.answer_callback_query(call.id, "Отменено.")
 
 # ----------------- Notification system -----------------
-def send_payment_notifications():
-    """Отправляет уведомления о необходимости оплаты - только полная оплата"""
-    try:
-        now = now_local()
-
-        # 1-го числа в 10:00 - уведомление о необходимости оплаты
-        if now.day == 1 and now.hour == 10:
-            current_month, current_year = get_current_period()
-            
-            # Находим пользователей с активными подписками за предыдущий период
-            cursor.execute("""
-                SELECT DISTINCT s.user_id, u.username 
-                FROM subscriptions s
-                JOIN users u ON s.user_id = u.user_id
-                WHERE s.active = 1 AND (s.current_period_month != ? OR s.current_period_year != ?)
-            """, (current_month, current_year))
-            
-            users = cursor.fetchall()
-            
-            for user_id, username in users:
-                try:
-                    text = (
-                        "📅 <b>Напоминание об оплате</b>\n\n"
-                        "Наступил новый месяц! Для продолжения доступа к группе обучения необходимо оплатить подписку.\n\n"
-                        "💳 <b>Полная оплата за месяц</b>\n"
-                        "⏰ <b>До 5 числа 23:59</b> необходимо оплатить полную стоимость подписки.\n\n"
-                        "Если оплата не поступит до 5 числа 23:59, доступ к группе будет приостановлен."
-                    )
-                    
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(types.InlineKeyboardButton("💳 Оплатить подписку", callback_data="show_plans_notification"))
-                    
-                    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
-                    
-                    # Обновляем время последнего уведомления
-                    cursor.execute("""
-                        UPDATE subscriptions 
-                        SET last_notification_ts = ? 
-                        WHERE user_id = ? AND active = 1
-                    """, (int(time.time()), user_id))
-                    conn.commit()
-                    
-                except Exception as e:
-                    logging.error(f"Error sending notification to user {user_id}: {e}")
-        
-        # 4-го числа в 18:00 - Напоминание о скором дедлайне
-        elif now.day == 4 and now.hour == 18 and now.minute == 0:
-            current_month, current_year = get_current_period()
-            
-            # Пользователи, которые еще не оплатили
-            cursor.execute("""
-                SELECT DISTINCT s.user_id, u.username 
-                FROM subscriptions s
-                JOIN users u ON s.user_id = u.user_id
-                WHERE s.active = 1 
-                AND (s.current_period_month != ? OR s.current_period_year != ? OR s.part_paid = 'none')
-            """, (current_month, current_year))
-            
-            users = cursor.fetchall()
-            
-            for user_id, username in users:
-                try:
-                    text = (
-                        "⏰ <b>Напоминание о дедлайне!</b>\n\n"
-                        "Завтра заканчивается период оплаты подписки!\n\n"
-                        "💳 <b>Успейте оплатить до 5 числа 23:59</b>\n"
-                        "• Полная оплата - доступ до 5 числа следующего месяца\n\n"
-                        "После 5 числа доступ к группе будет приостановлен."
-                    )
-                    
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(types.InlineKeyboardButton("💳 Оплатить сейчас", callback_data="show_plans_notification"))
-                    
-                    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
-                    
-                except Exception as e:
-                    logging.error(f"Error sending deadline notification to user {user_id}: {e}")
-                    
-    except Exception as e:
-        logging.error(f"Error in send_payment_notifications: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_plans_notification")
 def callback_show_plans_notification(call):
@@ -3435,100 +3768,276 @@ def check_expirations_loop():
     while True:
         try:
             now = now_local()
-
-            # Проверяем каждые 5 минут для уведомлений
-            if now.minute % 5 == 0:
-                send_payment_notifications()
-            
+            current_day = now.day
+            current_hour = now.hour
+            current_minute = now.minute
             current_month, current_year = get_current_period()
+            now_ts = int(time.time())
             
-            # 6-го числа в 00:00 - удаляем тех, кто не оплатил
-            if now.day == 6 and now.hour == 0 and now.minute == 0:
-                logging.info("🔄 Проверка экспирации: удаление неплативших пользователей")
-                
-                cursor.execute("""
-                    SELECT s.id, s.user_id, s.group_id, s.plan_id, p.title, u.username
-                    FROM subscriptions s
-                    JOIN plans p ON s.plan_id = p.id
-                    JOIN users u ON s.user_id = u.user_id
-                    WHERE s.active = 1 
-                    AND (s.current_period_month != ? OR s.current_period_year != ?)
-                """, (current_month, current_year))
-                
-                expired_subs = cursor.fetchall()
-                logging.info(f"📊 Найдено {len(expired_subs)} подписок для удаления")
-                
-                for sub_id, user_id, group_id, plan_id, plan_title, username in expired_subs:
-                    try:
-                        # Пытаемся удалить из группы
-                        if group_id:
-                            try:
-                                bot.kick_chat_member(group_id, user_id)
-                                logging.info(f"👤 Удален пользователь {username or user_id} из группы {group_id}")
-                                time.sleep(0.1)
-                            except Exception as e:
-                                logging.warning(f"❌ Не удалось удалить пользователя {user_id} из группы {group_id}: {e}")
-                        
-                        # Деактивируем подписку
-                        cursor.execute("UPDATE subscriptions SET active = 0, removed = 1 WHERE id = ?", (sub_id,))
-                        conn.commit()
-                        
-                        # Уведомляем пользователя
-                        try:
-                            bot.send_message(user_id, 
-                                           f"❌ Доступ к группе '{plan_title}' приостановлен.\n\n"
-                                           "Вы не оплатили подписку за текущий месяц. "
-                                           "Для восстановления доступа оплатите подписку в разделе '📋 Группы обучения'.")
-                            logging.info(f"📢 Отправлено уведомление пользователю {username or user_id}")
-                        except Exception as e:
-                            logging.warning(f"❌ Не удалось отправить уведомление пользователю {user_id}: {e}")
-                            
-                    except Exception as e:
-                        logging.error(f"❌ Ошибка обработки expired подписки {sub_id}: {e}")
+            # 6-го числа в 00:01 - удаление тех, кто не оплатил
+            if current_day == 6 and current_hour == 0 and current_minute == 1:
+                logging.info("🗑️ Удаление неплательщиков (6-е число)")
+                remove_unpaid_users()
+                time.sleep(60)
             
-            # Ежедневно проверяем истекшие подписки (на всякий случай)
-            elif now.hour == 1 and now.minute == 0:  # Каждый день в 01:00
-                logging.info("🔄 Ежедневная проверка истекших подписок")
-                
-                cursor.execute("""
-                    SELECT s.id, s.user_id, s.group_id, s.plan_id, p.title, u.username
-                    FROM subscriptions s
-                    JOIN plans p ON s.plan_id = p.id
-                    JOIN users u ON s.user_id = u.user_id
-                    WHERE s.active = 1 AND s.end_ts < ?
-                """, (int(time.time()),))
-                
-                expired_subs = cursor.fetchall()
-                
-                if expired_subs:
-                    logging.info(f"📊 Найдено {len(expired_subs)} подписок с истекшим сроком")
-                    
-                    for sub_id, user_id, group_id, plan_id, plan_title, username in expired_subs:
-                        try:
-                            # Пытаемся удалить из группы
-                            if group_id:
-                                try:
-                                    bot.kick_chat_member(group_id, user_id)
-                                    logging.info(f"👤 Удален пользователь {username or user_id} из группы {group_id} (истек срок)")
-                                    time.sleep(0.1)
-                                except Exception as e:
-                                    logging.warning(f"❌ Не удалось удалить пользователя {user_id} из группы {group_id}: {e}")
-                            
-                            # Деактивируем подписку
-                            cursor.execute("UPDATE subscriptions SET active = 0, removed = 1 WHERE id = ?", (sub_id,))
-                            conn.commit()
-                            
-                        except Exception as e:
-                            logging.error(f"❌ Ошибка обработки daily expired подписки {sub_id}: {e}")
+            # 1-го числа в 10:00 - уведомление о необходимости оплаты
+            elif current_day == 1 and current_hour == 10 and current_minute == 0:
+                logging.info("📅 Отправка уведомлений об оплате (1-е число)")
+                send_payment_notifications()
+                time.sleep(60)
+            
+            # 4-го числа в 18:00 - Напоминание о скором дедлайне
+            elif current_day == 4 and current_hour == 18 and current_minute == 0:
+                logging.info("⏰ Отправка напоминаний о дедлайне (4-е число)")
+                send_deadline_notifications()
+                time.sleep(60)
             
             time.sleep(60)  # Проверяем каждую минуту
             
         except Exception as e:
             logging.exception("❌ Критическая ошибка в check_expirations_loop")
-            time.sleep(60)  # Ждем минуту перед повторной попыткой         
+            time.sleep(60)
+
+def remove_unpaid_users():
+    """Удаляет пользователей с истекшими подписками из групп"""
+    try:
+        current_month, current_year = get_current_period()
+        now_ts = int(time.time())
+        
+        # Находим пользователей, чьи подписки истекли И не оплачены на текущий месяц
+        cursor.execute("""
+            SELECT DISTINCT s.id, s.user_id, s.group_id, s.plan_id, p.title, u.username
+            FROM subscriptions s
+            JOIN plans p ON s.plan_id = p.id
+            JOIN users u ON s.user_id = u.user_id
+            WHERE s.active = 1 
+            AND s.end_ts < ?
+            AND (
+                s.current_period_month != ? 
+                OR s.current_period_year != ? 
+                OR s.part_paid != 'full'
+            )
+        """, (now_ts, current_month, current_year))
+        
+        expired_subs = cursor.fetchall()
+        
+        if expired_subs:
+            logging.info(f"📊 Найдено {len(expired_subs)} подписок для удаления")
+            
+            for sub_id, user_id, group_id, plan_id, plan_title, username in expired_subs:
+                try:
+                    # Пытаемся удалить из группы
+                    if group_id:
+                        try:
+                            # Используем ban_chat_member с коротким баном (30 секунд)
+                            bot.ban_chat_member(group_id, user_id, until_date=now_ts + 30)
+                            logging.info(f"👤 Удален пользователь {username or user_id} из группы {group_id}")
+                            time.sleep(0.5)  # Задержка для API
+                        except Exception as e:
+                            logging.warning(f"❌ Не удалось удалить пользователя {user_id} из группы {group_id}: {e}")
+                            # Не останавливаем выполнение, продолжаем с остальными
+                    
+                    # Деактивируем подписку
+                    cursor.execute("UPDATE subscriptions SET active = 0, removed = 1 WHERE id = ?", (sub_id,))
+                    conn.commit()
+                    
+                    # Уведомляем пользователя
+                    try:
+                        bot.send_message(user_id, 
+                                       f"❌ Доступ к группе '{plan_title}' приостановлен.\n\n"
+                                       "Вы не оплатили подписку за текущий месяц. "
+                                       "Для восстановления доступа оплатите подписку в разделе '📋 Группы обучения'.")
+                        logging.info(f"📢 Отправлено уведомление пользователю {username or user_id}")
+                    except Exception as e:
+                        logging.warning(f"❌ Не удалось отправить уведомление пользователю {user_id}: {e}")
+                        
+                except Exception as e:
+                    logging.error(f"❌ Ошибка обработки подписки {sub_id}: {e}")
+                    continue  # Продолжаем обработку остальных
+                    
+    except Exception as e:
+        logging.error(f"❌ Ошибка в remove_unpaid_users: {e}")
+
+def safe_remove_from_chat(chat_id, user_id):
+    """Безопасное удаление пользователя из чата"""
+    try:
+        # Проверяем, есть ли пользователь в чате
+        try:
+            member = bot.get_chat_member(chat_id, user_id)
+            if member.status in ['left', 'kicked']:
+                return True  # Уже не в чате
+        except:
+            return True  # Пользователь не найден в чате
+        
+        # Пытаемся удалить с коротким баном
+        bot.ban_chat_member(chat_id, user_id, until_date=int(time.time()) + 30)
+        time.sleep(0.3)  # Задержка для API
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка удаления пользователя {user_id} из чата {chat_id}: {e}")
+        return False
 
 # Запускаем фоновые процессы
 threading.Thread(target=check_expirations_loop, daemon=True).start()
+
+def send_deadline_notifications():
+    """Отправляет уведомления о скором дедлайне оплаты с кнопкой продления"""
+    try:
+        current_month, current_year = get_current_period()
+        now_ts = int(time.time())
+        
+        # Находим подписки, которые истекают в ближайшие 5 дней
+        cursor.execute("""
+            SELECT s.user_id, u.username, s.plan_id, p.title, s.end_ts, p.price_cents, s.id as sub_id
+            FROM subscriptions s
+            JOIN users u ON s.user_id = u.user_id
+            JOIN plans p ON s.plan_id = p.id
+            WHERE s.active = 1 
+            AND s.end_ts BETWEEN ? AND ?
+            AND (s.current_period_month = ? AND s.current_period_year = ? AND s.part_paid = 'full')
+            ORDER BY s.end_ts
+        """, (now_ts, now_ts + 5*24*3600, current_month, current_year))
+        
+        users = cursor.fetchall()
+        
+        notification_count = 0
+        for user_id, username, plan_id, plan_title, end_ts, price_cents, sub_id in users:
+            try:
+                days_left = (end_ts - now_ts) // (24 * 3600)
+                
+                text = (
+                    f"⏰ <b>Напоминание о дедлайне!</b>\n\n"
+                    f"Группа: {plan_title}\n"
+                    f"📅 Срок действия подписки заканчивается через {days_left} дней ({datetime.fromtimestamp(end_ts, LOCAL_TZ).strftime('%d.%m.%Y')})\n\n"
+                    f"💳 <b>Успейте продлить подписку!</b>\n"
+                    f"• Полная оплата - доступ до 5 числа следующего месяца\n\n"
+                    f"После истечения срока доступ к группе будет приостановлен."
+                )
+                
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton(f"🔄 Продлить за {price_str_from_cents(price_cents)}", 
+                                                     callback_data=f"renew_plan:{plan_id}"))
+                
+                bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+                notification_count += 1
+                
+                logging.info(f"📨 Отправлено уведомление о дедлайне пользователю {user_id}")
+                
+            except Exception as e:
+                logging.error(f"Error sending deadline notification to user {user_id}: {e}")
+        
+        logging.info(f"📊 Отправлено {notification_count} уведомлений о дедлайне")
+                
+    except Exception as e:
+        logging.error(f"Error in send_deadline_notifications: {e}")
+
+def send_payment_notifications():
+    """Отправляет уведомления о необходимости оплаты - только тем, кто не оплатил"""
+    try:
+        current_month, current_year = get_current_period()
+        now_ts = int(time.time())
+        now = now_local()
+        
+        # Находим пользователей с активными подписками, но не оплаченными на текущий месяц
+        cursor.execute("""
+            SELECT DISTINCT s.user_id, u.username, s.plan_id, p.title, p.price_cents, s.id as sub_id
+            FROM subscriptions s
+            JOIN users u ON s.user_id = u.user_id
+            JOIN plans p ON s.plan_id = p.id
+            WHERE s.active = 1 
+            AND s.end_ts < ?
+            AND NOT (
+                s.current_period_month = ? 
+                AND s.current_period_year = ? 
+                AND s.part_paid = 'full'
+            )
+            ORDER BY s.user_id
+        """, (now_ts, current_month, current_year))
+        
+        users = cursor.fetchall()
+        
+        notification_count = 0
+        for user_id, username, plan_id, plan_title, price_cents, sub_id in users:
+            try:
+                text = (
+                    f"📅 <b>Напоминание об оплате за {now.strftime('%B %Y')}</b>\n\n"
+                    f"Группа: {plan_title}\n"
+                    f"Наступил новый месяц! Для продолжения доступа к группе обучения необходимо оплатить подписку.\n\n"
+                    f"💰 Сумма к оплате: {price_str_from_cents(price_cents)}\n"
+                    f"⏰ <b>Оплатите до 5 числа следующего месяца</b>\n\n"
+                    f"После истечения срока доступ к группе будет приостановлен."
+                )
+                
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton(f"💳 Оплатить {price_str_from_cents(price_cents)}", 
+                                                     callback_data=f"renew_plan:{plan_id}"))
+                
+                bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+                notification_count += 1
+                
+                # Обновляем время последнего уведомления
+                cursor.execute("""
+                    UPDATE subscriptions 
+                    SET last_notification_ts = ? 
+                    WHERE id = ?
+                """, (now_ts, sub_id))
+                conn.commit()
+                
+                logging.info(f"📨 Отправлено уведомление об оплате пользователю {user_id} ({username or 'нет username'})")
+                
+            except Exception as e:
+                logging.error(f"Error sending notification to user {user_id}: {e}")
+        
+        logging.info(f"📊 Отправлено {notification_count} уведомлений об оплате")
+                    
+    except Exception as e:
+        logging.error(f"Error in send_payment_notifications: {e}")
+        
+def check_existing_subscription(user_id, plan_id):
+    """Проверяет, есть ли у пользователя активная подписка на план"""
+    current_month, current_year = get_current_period()
+    now_ts = int(time.time())
+    
+    cursor.execute("""
+        SELECT s.id, s.active, s.part_paid, s.end_ts, p.title, 
+               s.current_period_month, s.current_period_year,
+               s.user_id, s.plan_id, s.group_id
+        FROM subscriptions s
+        JOIN plans p ON s.plan_id = p.id
+        WHERE s.user_id = ? AND s.plan_id = ? 
+        AND s.active = 1
+        ORDER BY s.end_ts DESC
+        LIMIT 1
+    """, (user_id, plan_id))
+    
+    existing = cursor.fetchone()
+    if not existing:
+        return None
+    
+    (sub_id, active, part_paid, end_ts, plan_title, 
+     sub_month, sub_year, user_id, plan_id, group_id) = existing
+    
+    # Определяем статус оплаты
+    paid_for_current = (sub_month == current_month and 
+                       sub_year == current_year and 
+                       part_paid == 'full' and 
+                       end_ts > now_ts)
+    
+    return {
+        'id': sub_id,
+        'paid': paid_for_current,  # Булево значение: True если оплачена на текущий месяц
+        'active': bool(active),
+        'part_paid': part_paid,
+        'end_ts': end_ts,
+        'plan_title': plan_title,
+        'current_month': sub_month,
+        'current_year': sub_year,
+        'user_id': user_id,
+        'plan_id': plan_id,
+        'group_id': group_id,
+        'needs_renewal': not paid_for_current or end_ts <= now_ts,
+        'status': 'paid' if paid_for_current else 'expired' if end_ts < now_ts else 'needs_payment'
+    }
 
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("edit_field:category:"))
 def callback_edit_category_field(call):
